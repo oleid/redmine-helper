@@ -88,7 +88,9 @@ fn main() -> Result<(), failure::Error> {
     let password = keyring.get_password().unwrap_or_else(|_| {
         let pw =
             rpassword::prompt_password_stderr(&format!("Password for {}: ", username)).unwrap();
-        keyring.set_password(&pw).unwrap();
+        keyring
+            .set_password(&pw)
+            .unwrap_or_else(|e| println!("Couldn't store password to keyring, I'm sorry: {}", e));
         pw
     });
 
