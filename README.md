@@ -8,8 +8,15 @@ A tool to show how many over/undertime work hours you have. It connects to redmi
 
 Example:
 
-    redmine-helper --username OlafLeidinger --to 2018-09-30 --from=2018-01-01 --teilzeit=0.8
+    redmine-helper --username MaxMustermann --to 2018-09-30 --from=2018-01-01 --teilzeit=0.8
 
+## Days of absence
+A file called `absence.json` needs to be be placed to `~/.config/redmine-helper/` to
+configure your vacation or illness days. C.f. the folder `doc` for an example.
+
+## Config file
+Defaults for parameters like `--username` or `--teilzeit`
+can be configured in `config.json`, same folder as `absence.json`.
 
 # Building
 

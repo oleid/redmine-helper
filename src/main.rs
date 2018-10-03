@@ -1,133 +1,184 @@
 extern crate chrono;
 extern crate clap;
+extern crate directories;
 extern crate failure;
 extern crate keyring;
+extern crate rayon;
 extern crate rpassword;
 
 #[macro_use]
 extern crate serde_derive;
 
+#[macro_use]
+extern crate prettytable;
+
+mod absence;
 mod date_helper;
 mod feiertage;
+mod program_config;
 mod redmine;
 
 use chrono::Datelike;
 use date_helper::*;
-
-fn month_span_from_args(
-    v: &clap::ArgMatches,
-) -> Result<(chrono::NaiveDate, chrono::NaiveDate), failure::Error> {
-    let from = v
-        .value_of("from")
-        .ok_or(failure::err_msg("from not given as argument"))?
-        .parse()?;
-    let to = v
-        .value_of("to")
-        .ok_or(failure::err_msg("to not given as argument"))?
-        .parse()?;
-
-    Ok((from, to))
-}
+use prettytable::{format, Cell, Row, Table};
+use rayon::prelude::*;
+use std::iter::FromIterator;
 
 fn main() -> Result<(), failure::Error> {
-    use clap::{App, Arg};
+    use std::collections::BTreeSet;
 
-    let from_txt = format!("{}", current_month());
-    let to_txt = format!("{}", next_month(current_month()).pred());
+    let s = program_config::get_settings()?;
 
-    let matches = App::new("Redmine-Stundentafel")
-        .version("0.0")
-        .author("Olaf Leidinger<olaf.leidinger@indurad.com>")
-        .about("Zeigt die Soll- sowie die Ist-Stundenzahl an")
-        .arg(
-            Arg::with_name("tf")
-                .short("z")
-                .long("teilzeit")
-                .value_name("FAKTOR")
-                .help("Skalierungsfaktor für Wochenstunden")
-                .default_value("1")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("user")
-                .short("u")
-                .long("username")
-                .value_name("USERNAME")
-                .help("Username for redmine login")
-                .required(true)
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("from")
-                .short("f")
-                .long("from")
-                .value_name("DATE")
-                .help("Startdatum für Zeitabfrage")
-                .default_value(&from_txt)
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("to")
-                .short("t")
-                .long("to")
-                .value_name("DATE")
-                .help("Enddatum für Zeitabfrage")
-                .default_value(&to_txt),
-        )
-        .get_matches();
-
-    let (from, to) = month_span_from_args(&matches)?;
-
-    let tz_factor = 8.0 * matches.value_of("tf").unwrap().parse::<f32>()?;
-
-    let service = "redmine.indurad.x";
-    let username = matches.value_of("user").unwrap();
-
-    let keyring = keyring::Keyring::new(&service, &username);
-
-    let password = keyring.get_password().unwrap_or_else(|_| {
-        let pw =
-            rpassword::prompt_password_stderr(&format!("Password for {}: ", username)).unwrap();
-        keyring
-            .set_password(&pw)
-            .unwrap_or_else(|e| println!("Couldn't store password to keyring, I'm sorry: {}", e));
-        pw
-    });
-
-    let feiertage =
-        years_in_range(from, to).fold(std::collections::BTreeMap::new(), |mut accum, year| {
-            accum.extend(feiertage::get_holidays(year, feiertage::Bundesland::NW).unwrap());
-            accum
-        });
-
-    let is_no_holiday = |d: &chrono::NaiveDate| !feiertage.contains_key(d);
-
-    {
-        println!("|_.Monat\t|_.Arbeitstage\t|_.Sollstunden\t|_.Red.stunden\t|_.Differenz |");
-        let mut cur = from;
-
-        while cur < to {
-            let last_day_in_month = next_month(cur).pred();
-            let hours_sum =
-                redmine::HoursSpent::range(cur, last_day_in_month, username, &password)?
-                    .fold(0.0, |v, time_res| {
-                        v + time_res.ok().and_then(|t| Some(t.hours)).unwrap_or(0.0)
-                    });
-
-            let workdays = count_weekdays(cur, next_month(cur), &is_no_holiday);
-            let work_hours = workdays as f32 * tz_factor;
-            println!(
-                "|{}/{:02}     \t|{:>13}\t|{:>13.2}\t|{:>13.2}\t|{:>+11.2} |",
-                cur.year(),
-                cur.month(),
-                workdays,
-                work_hours,
-                hours_sum,
-                hours_sum - work_hours
+    let planned_absence =
+        BTreeSet::from_iter(absence::get_days_of_absence(s.from, s.to)?.into_iter());
+    let vacation_days = years_in_range(s.from, s.to).fold(
+        std::collections::BTreeSet::new(),
+        |mut accum: BTreeSet<chrono::NaiveDate>, year| {
+            accum.extend(
+                feiertage::get_holidays(year, feiertage::Bundesland::NW)
+                    .unwrap()
+                    .keys(),
             );
+            accum
+        },
+    );
 
-            cur = next_month(cur);
+    let is_no_holiday = |d: &chrono::NaiveDate| !vacation_days.contains(d);
+
+    let is_no_holiday_and_not_absent =
+        |d: &chrono::NaiveDate| !vacation_days.contains(d) && !planned_absence.contains(d);
+
+    // rayon is used to perform redmine calls in parallel.
+    // Since these tasks are IO bound, it's not really the right tool, but is does the job fine.
+    // The number of threads can be a lot higher than the number of cores.
+    // But it shouldn't overload the server either.
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(10)
+        .build_global()
+        .unwrap();
+
+    let mut table = Table::new();
+    {
+        table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
+        table.set_titles(row![
+            "Monat",
+            "Arbeitstage",
+            "davon Abwesend",
+            "Sollstunden",
+            "Redmine-Stunden",
+            "Differenz"
+        ]);
+
+        let table_data = {
+            let mut cur = s.from;
+            let mut dates = Vec::new();
+            while cur < s.to {
+                dates.push(cur);
+                cur = next_month(cur);
+            }
+            dates
+        }
+        .par_iter()
+        .map(|date| {
+            let workdays = count_weekdays(*date, next_month(*date), &is_no_holiday);
+            let days_of_absence =
+                workdays - count_weekdays(*date, next_month(*date), &is_no_holiday_and_not_absent);
+
+            let work_hours = (workdays - days_of_absence) as f32 * s.tz_factor;
+
+            (
+                *date,
+                RowData {
+                    workdays,
+                    days_of_absence,
+                    work_hours,
+                    ..RowData::default()
+                } + query_redmine_month(*date, &s),
+            )
+        })
+        .collect::<Vec<(chrono::NaiveDate, RowData)>>();
+
+        for (date, data) in table_data.iter() {
+            table.add_row(make_row(
+                Cell::new(&format!("{}/{:02}", date.year(), date.month())).style_spec("i"),
+                data,
+            ));
+        }
+
+        if table_data.len() > 1 {
+            let sum = table_data
+                .iter()
+                .fold(RowData::default(), |accum, (_, data)| accum + data.clone());
+
+            table.add_empty_row();
+            table.add_row(make_row(Cell::new("Gesamt").style_spec("b"), &sum));
         }
     }
+    table.printstd();
+
     Ok(())
+}
+
+#[derive(Debug, Default, Clone)]
+struct RowData {
+    workdays: usize,
+    days_of_absence: usize,
+    work_hours: f32,
+    redmine_hours: f32,
+}
+
+impl std::ops::Add for RowData {
+    type Output = Self;
+    fn add(self, other: Self) -> Self {
+        RowData {
+            workdays: self.workdays + other.workdays,
+            days_of_absence: self.days_of_absence + other.days_of_absence,
+            work_hours: self.work_hours + other.work_hours,
+            redmine_hours: self.redmine_hours + other.redmine_hours,
+        }
+    }
+}
+
+fn query_redmine_month(date: chrono::NaiveDate, settings: &program_config::Settings) -> RowData {
+    let last_day_in_month = next_month(date).pred();
+
+    RowData {
+        redmine_hours: redmine::HoursSpent::range(
+            date,
+            last_day_in_month,
+            &settings.username,
+            &settings.password,
+        )
+        .unwrap()
+        .fold(0.0, |v, time_res| {
+            v + time_res.ok().and_then(|t| Some(t.hours)).unwrap_or(0.0)
+        }),
+        ..RowData::default()
+    }
+}
+
+fn make_row(caption: Cell, data: &RowData) -> Row {
+    Row::new(vec![
+        caption,
+        fmt_cell(data.workdays),
+        fmt_cell(data.days_of_absence),
+        fmt_cell(data.work_hours),
+        fmt_cell(data.redmine_hours),
+        fmt_cell(data.redmine_hours - data.work_hours),
+    ])
+}
+
+fn fmt_cell<T>(val: T) -> prettytable::Cell
+where
+    T: std::fmt::Display + PartialOrd + Default,
+{
+    use prettytable::Cell;
+
+    let txt = format!("{:.2}", val);
+
+    if val < T::default() {
+        Cell::new(&txt).style_spec("rFr")
+    } else {
+        Cell::new(&txt).style_spec("r")
+    }
 }

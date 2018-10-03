@@ -14,8 +14,11 @@ lto = true
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 clap = "2"
+directories = "1.0"
 failure = "0.1"
 keyring = "0.6"
+prettytable-rs = "0.8"
+rayon = "1.0"
 reqwest = "0.9"
 rpassword = "2.0.0"
 serde_derive = "1.0"
