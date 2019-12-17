@@ -7,6 +7,9 @@ extern crate rayon;
 extern crate rpassword;
 
 #[macro_use]
+extern crate log;
+
+#[macro_use]
 extern crate serde_derive;
 
 #[macro_use]
@@ -22,31 +25,21 @@ use chrono::Datelike;
 use date_helper::*;
 use prettytable::{format, Cell, Row, Table};
 use rayon::prelude::*;
-use std::iter::FromIterator;
 
 fn main() -> Result<(), failure::Error> {
-    use std::collections::BTreeSet;
+    env_logger::init();
 
     let s = program_config::get_settings()?;
-
-    let planned_absence =
-        BTreeSet::from_iter(absence::get_days_of_absence(s.from, s.to)?.into_iter());
-    let vacation_days = years_in_range(s.from, s.to).fold(
-        std::collections::BTreeSet::new(),
-        |mut accum: BTreeSet<chrono::NaiveDate>, year| {
-            accum.extend(
-                feiertage::get_holidays(year, feiertage::Bundesland::NW)
-                    .unwrap()
-                    .keys(),
-            );
-            accum
-        },
-    );
-
-    let is_no_holiday = |d: &chrono::NaiveDate| !vacation_days.contains(d);
-
-    let is_no_holiday_and_not_absent =
-        |d: &chrono::NaiveDate| !vacation_days.contains(d) && !planned_absence.contains(d);
+    let planned_absence = absence::get_days_of_absence(s.from, s.to)?.into_iter();
+    let vacation_days = years_in_range(s.from, s.to)
+        .map(|year| {
+            feiertage::get_holidays(year, feiertage::Bundesland::NW)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(k, _)| k)
+        })
+        .flatten();
+    let absence = Absence::new(planned_absence, vacation_days);
 
     // rayon is used to perform redmine calls in parallel.
     // Since these tasks are IO bound, it's not really the right tool, but is does the job fine.
@@ -80,9 +73,8 @@ fn main() -> Result<(), failure::Error> {
         }
         .par_iter()
         .map(|date| {
-            let workdays = count_weekdays(*date, next_month(*date), &is_no_holiday);
-            let days_of_absence =
-                workdays - count_weekdays(*date, next_month(*date), &is_no_holiday_and_not_absent);
+            let (workdays, days_of_absence) =
+                absence.workdays_and_absence(*date, next_month(*date));
 
             let work_hours = (workdays - days_of_absence) as f32 * s.tz_factor;
 
@@ -142,6 +134,11 @@ impl std::ops::Add for RowData {
 fn query_redmine_month(date: chrono::NaiveDate, settings: &program_config::Settings) -> RowData {
     let last_day_in_month = next_month(date).pred();
 
+    debug!(
+        "query_redmine_month: from {} to {}",
+        date, last_day_in_month
+    );
+
     RowData {
         redmine_hours: redmine::HoursSpent::range(
             date,
@@ -172,8 +169,6 @@ fn fmt_cell<T>(val: T) -> prettytable::Cell
 where
     T: std::fmt::Display + PartialOrd + Default,
 {
-    use prettytable::Cell;
-
     let txt = format!("{:.2}", val);
 
     if val < T::default() {
