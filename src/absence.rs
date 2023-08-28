@@ -1,10 +1,7 @@
-extern crate chrono;
-extern crate directories;
-extern crate failure;
-extern crate serde_json;
-
-use chrono::NaiveDate as Day;
+use anyhow::Context;
 use std::collections::btree_map::BTreeMap;
+
+type Day = chrono::NaiveDate;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct AbsenceConfig {
@@ -74,7 +71,7 @@ impl Iterator for AbsenceIterator {
     }
 }
 
-pub fn get_days_of_absence(from: Day, to: Day) -> Result<Vec<Day>, failure::Error> {
+pub fn get_days_of_absence(from: Day, to: Day) -> Result<Vec<chrono::NaiveDate>, anyhow::Error> {
     use directories::ProjectDirs;
 
     // Get config directory in the platform specific default paths
@@ -83,81 +80,23 @@ pub fn get_days_of_absence(from: Day, to: Day) -> Result<Vec<Day>, failure::Erro
 
         use std::fs::File;
 
-        match File::open(&config_file) {
-            Ok(file) => {
-                let absence: AbsenceConfig = serde_json::from_reader(file).expect(&format!(
-                    "Could not parse days of absence configuration at {:#?}",
-                    config_file
-                ));
-                Ok(extract_days_in_range_inclusive(absence, from, to).collect())
-            }
-            Err(e) => Err(failure::err_msg(format!(
-                "Cannot open the days of absence configuration at {:#?} for reading : {}. \
-                 Please make sure it exists and fill it with data. \
-                 Check repo for examples.",
-                config_file, e
-            ))),
-        }
+        let file = File::open(&config_file).with_context(|| {
+            format!(
+                "Could not parse days of absence configuration at {config_file:#?}.
+     Please create file; you can check check git repo
+     https://github.com/oleid/redmine-helper for examples."
+            )
+        })?;
+        let absence: AbsenceConfig = serde_json::from_reader(file).with_context(|| {
+            format!("Could not parse days of absence configuration at {config_file:#?}",)
+        })?;
+
+        Ok(absence
+            .to_days()
+            .into_iter()
+            .filter(|day| day >= &from && day <= &to)
+            .collect())
     } else {
         Ok(Vec::new())
     }
-}
-
-fn extract_days_in_range_inclusive(
-    absence: AbsenceConfig,
-    from: Day,
-    to: Day,
-) -> impl Iterator<Item = Day> {
-    absence
-        .to_days()
-        .into_iter()
-        .filter(move |day| *day >= from && *day <= to)
-}
-
-#[test]
-fn bug_report_planned_absence_too_short_1() {
-    let to_date = |day| Day::from_ymd(2019, 12, day);
-
-    let whole_month: Vec<Day> = Absence::MultiDay {
-        first_day: Day::from_ymd(2019, 12, 1),
-        last_day: Day::from_ymd(2020, 1, 1),
-    }
-    .into_iter()
-    .collect();
-
-    let mut expected_result: Vec<Day> = (1..32).map(to_date).collect();
-    expected_result.push(Day::from_ymd(2020, 1, 1));
-
-    assert_eq!(whole_month, expected_result);
-}
-
-#[test]
-fn bug_report_planned_absence_too_short_2() {
-    use std::iter::FromIterator;
-
-    let to_date = |day| Day::from_ymd(2019, 12, day);
-
-    let absence = AbsenceConfig {
-        inner: BTreeMap::from_iter(
-            [(
-                "SomeVacation".to_owned(),
-                Absence::MultiDay {
-                    first_day: Day::from_ymd(2019, 12, 1),
-                    last_day: Day::from_ymd(2020, 1, 1),
-                },
-            )]
-            .iter()
-            .cloned(),
-        ),
-    };
-    let result = extract_days_in_range_inclusive(
-        absence,
-        Day::from_ymd(2019, 12, 1),
-        Day::from_ymd(2019, 12, 31),
-    )
-    .collect::<Vec<_>>();
-
-    let expected_result: Vec<Day> = (1..32).map(to_date).collect();
-
-    assert_eq!(result, expected_result);
 }

@@ -1,14 +1,3 @@
-extern crate chrono;
-extern crate clap;
-extern crate directories;
-extern crate failure;
-extern crate keyring;
-extern crate rayon;
-extern crate rpassword;
-
-#[macro_use]
-extern crate log;
-
 #[macro_use]
 extern crate serde_derive;
 
@@ -21,94 +10,189 @@ mod feiertage;
 mod program_config;
 mod redmine;
 
-use chrono::Datelike;
-use date_helper::*;
+use crate::date_helper::*;
+use crate::program_config::Settings;
+use anyhow::Context;
+use chrono::{Datelike, Duration, NaiveDate, Weekday};
 use prettytable::{format, Cell, Row, Table};
-use rayon::prelude::*;
+use reqwest::Client;
+use std::{collections::BTreeSet, iter::FromIterator};
 
-fn main() -> Result<(), failure::Error> {
-    env_logger::init();
-
+#[tokio::main]
+async fn main() -> Result<(), anyhow::Error> {
     let s = program_config::get_settings()?;
-    let planned_absence = absence::get_days_of_absence(s.from, s.to)?.into_iter();
-    let vacation_days = years_in_range(s.from, s.to)
-        .map(|year| {
-            feiertage::get_holidays(year, feiertage::Bundesland::NW)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(k, _)| k)
-        })
-        .flatten();
-    let absence = Absence::new(planned_absence, vacation_days);
 
-    // rayon is used to perform redmine calls in parallel.
-    // Since these tasks are IO bound, it's not really the right tool, but is does the job fine.
-    // The number of threads can be a lot higher than the number of cores.
-    // But it shouldn't overload the server either.
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(10)
-        .build_global()
-        .unwrap();
+    let planned_absence =
+        BTreeSet::from_iter(absence::get_days_of_absence(s.from, s.to)?.into_iter());
+    let vacation_days = get_vacation_days_for(&s).await?;
 
     let mut table = Table::new();
-    {
-        table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
-        table.set_titles(row![
-            "Monat",
-            "Arbeitstage",
-            "davon Abwesend",
-            "Sollstunden",
-            "Redmine-Stunden",
-            "Differenz"
-        ]);
+    table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
+    table.set_titles(row![
+        "Monat",
+        "Arbeitstage",
+        "davon Abwesend",
+        "Sollstunden",
+        "Redmine-Stunden",
+        "Differenz"
+    ]);
 
-        let table_data = {
-            let mut cur = s.from;
-            let mut dates = Vec::new();
-            while cur < s.to {
-                dates.push(cur);
-                cur = next_month(cur);
-            }
-            dates
-        }
-        .par_iter()
-        .map(|date| {
-            let (workdays, days_of_absence) =
-                absence.workdays_and_absence(*date, next_month(*date));
+    let table_data =
+        query_redmine(&s, planned_absence, vacation_days, reqwest::Client::new()).await?;
 
-            let work_hours = (workdays - days_of_absence) as f32 * s.tz_factor;
+    for (start_date, end_date, data) in table_data.iter() {
+        let last_day_included = end_date.pred();
 
-            (
-                *date,
-                RowData {
-                    workdays,
-                    days_of_absence,
-                    work_hours,
-                    ..RowData::default()
-                } + query_redmine_month(*date, &s),
-            )
-        })
-        .collect::<Vec<(chrono::NaiveDate, RowData)>>();
-
-        for (date, data) in table_data.iter() {
-            table.add_row(make_row(
-                Cell::new(&format!("{}/{:02}", date.year(), date.month())).style_spec("i"),
-                data,
-            ));
+        if last_day_included - *start_date == Duration::zero() {
+            continue;
         }
 
-        if table_data.len() > 1 {
-            let sum = table_data
-                .iter()
-                .fold(RowData::default(), |accum, (_, data)| accum + data.clone());
-
-            table.add_empty_row();
-            table.add_row(make_row(Cell::new("Gesamt").style_spec("b"), &sum));
-        }
+        table.add_row(make_row(
+            Cell::new(&if (*end_date - *start_date).num_days() > 7 {
+                format!("{}/{:02}", start_date.year(), start_date.month())
+            } else if start_date.weekday() == Weekday::Mon {
+                format!(
+                    "{} KW{:02}",
+                    start_date.year(),
+                    start_date.iso_week().week()
+                )
+            } else if start_date.month() == last_day_included.month() {
+                format!(
+                    "{}/{:02}/{:02} - {:02}",
+                    start_date.year(),
+                    start_date.month(),
+                    start_date.day(),
+                    last_day_included.day()
+                )
+            } else {
+                format!(
+                    "{}/{:02}/{:02} - {:02}/{:02}",
+                    start_date.year(),
+                    start_date.month(),
+                    start_date.day(),
+                    last_day_included.month(),
+                    last_day_included.day()
+                )
+            })
+            .style_spec("i"),
+            &data,
+        ));
     }
+
+    if table_data.len() > 1 {
+        let sum = table_data
+            .iter()
+            .fold(RowData::default(), |accum, (_, _, data)| {
+                accum + data.clone()
+            });
+
+        table.add_empty_row();
+        table.add_row(make_row(Cell::new("Gesamt").style_spec("b"), &sum));
+    }
+
     table.printstd();
 
     Ok(())
+}
+
+async fn query_redmine(
+    s: &Settings,
+    planned_absence: BTreeSet<NaiveDate>,
+    vacation_days: BTreeSet<NaiveDate>,
+    http_client: Client,
+) -> anyhow::Result<Vec<(NaiveDate, NaiveDate, RowData)>> {
+    let mut tasks: Vec<tokio::task::JoinHandle<_>> = Vec::new();
+    for (start_date, end_date) in get_date_ranges_to_query(&s) {
+        let vacation_days = vacation_days.clone();
+        let planned_absence = planned_absence.clone();
+        let client = http_client.clone();
+        let settings = s.clone();
+        tasks.push(tokio::spawn(async move {
+            compute_table_row(
+                vacation_days,
+                planned_absence,
+                settings,
+                client,
+                start_date,
+                end_date,
+            )
+            .await
+        }));
+    }
+
+    let mut table_data = Vec::new();
+    for task in tasks {
+        let res = task.await??;
+        table_data.push(res);
+    }
+    Ok(table_data)
+}
+
+/// vec of ranges, 2nd item won't be included in query
+fn get_date_ranges_to_query(s: &Settings) -> Vec<(NaiveDate, NaiveDate)> {
+    let mut cur = s.from;
+    let mut dates = Vec::new();
+
+    loop {
+        if cur < s.to {
+            cur = if next_month(cur) < s.to {
+                dates.push((cur, next_month(cur)));
+                next_month(cur)
+            } else if next_week_monday(cur) < s.to {
+                dates.push((cur, next_week_monday(cur)));
+                next_week_monday(cur)
+            } else {
+                dates.push((cur, s.to.succ()));
+                s.to.succ()
+            };
+        } else {
+            break;
+        }
+    }
+    dates
+}
+
+async fn compute_table_row(
+    vacation_days: BTreeSet<NaiveDate>,
+    planned_absence: BTreeSet<NaiveDate>,
+    s: Settings,
+    client: Client,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+) -> anyhow::Result<(NaiveDate, NaiveDate, RowData)> {
+    let is_no_holiday = |d: &chrono::NaiveDate| !vacation_days.contains(d);
+
+    let is_no_holiday_and_not_absent =
+        |d: &chrono::NaiveDate| !vacation_days.contains(d) && !planned_absence.contains(d);
+
+    let workdays = count_weekdays(start_date, end_date, &is_no_holiday);
+    let days_of_absence =
+        workdays - count_weekdays(start_date, end_date, &is_no_holiday_and_not_absent);
+
+    let work_hours = (workdays - days_of_absence) as f32 * s.tz_factor;
+    Ok((
+        start_date,
+        end_date,
+        RowData {
+            workdays,
+            days_of_absence,
+            work_hours,
+            ..RowData::default()
+        } + row_data_from_redmine(start_date, end_date, &s, client.clone()).await?,
+    ))
+}
+
+async fn get_vacation_days_for(s: &Settings) -> anyhow::Result<BTreeSet<NaiveDate>> {
+    let mut accum: BTreeSet<NaiveDate> = std::collections::BTreeSet::new();
+    for year in years_in_range(s.from, s.to) {
+        accum.extend(
+            feiertage::get_holidays(year, feiertage::Bundesland::NW)
+                .await
+                .with_context(|| format!("When querying holidays for {year}"))?
+                .keys(),
+        );
+    }
+    Ok(accum)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -131,27 +215,28 @@ impl std::ops::Add for RowData {
     }
 }
 
-fn query_redmine_month(date: chrono::NaiveDate, settings: &program_config::Settings) -> RowData {
-    let last_day_in_month = next_month(date).pred();
+async fn row_data_from_redmine(
+    start_date: chrono::NaiveDate,
+    end_date: chrono::NaiveDate,
+    settings: &program_config::Settings,
+    client: reqwest::Client,
+) -> anyhow::Result<RowData> {
+    let redmine_hours = redmine::HoursSpent::range(
+        start_date,
+        end_date,
+        &settings.username,
+        &settings.password,
+        client,
+    )
+    .run()
+    .await?
+    .into_iter()
+    .fold(0.0, |v, time_res| v + time_res.hours);
 
-    debug!(
-        "query_redmine_month: from {} to {}",
-        date, last_day_in_month
-    );
-
-    RowData {
-        redmine_hours: redmine::HoursSpent::range(
-            date,
-            last_day_in_month,
-            &settings.username,
-            &settings.password,
-        )
-        .unwrap()
-        .fold(0.0, |v, time_res| {
-            v + time_res.ok().and_then(|t| Some(t.hours)).unwrap_or(0.0)
-        }),
+    Ok(RowData {
+        redmine_hours,
         ..RowData::default()
-    }
+    })
 }
 
 fn make_row(caption: Cell, data: &RowData) -> Row {

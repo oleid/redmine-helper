@@ -1,11 +1,3 @@
-extern crate chrono;
-extern crate clap;
-extern crate directories;
-extern crate failure;
-extern crate keyring;
-extern crate rpassword;
-extern crate serde_json;
-
 #[derive(Deserialize, Debug, Default)]
 struct Config {
     pub username: Option<String>,
@@ -41,8 +33,8 @@ fn get_settings_and_cmdline_parser() -> (clap::ArgMatches<'static>, Config) {
 
     (
         App::new("Redmine-Stundentafel")
-            .version("0.0")
-            .author("Olaf Leidinger<olaf.leidinger@indurad.com>")
+            .version("0.1.1")
+            .author("Olaf Leidinger<oleid@meschaet.de>")
             .about("Zeigt die Soll- sowie die Ist-Stundenzahl an")
             .arg(
                 Arg::with_name("tf")
@@ -66,7 +58,7 @@ fn get_settings_and_cmdline_parser() -> (clap::ArgMatches<'static>, Config) {
                     .short("f")
                     .long("from")
                     .value_name("DATE")
-                    .help("Startdatum für Zeitabfrage")
+                    .help("Startdatum für Zeitabfrage. Standard = Monatsanfang")
                     .takes_value(true),
             )
             .arg(
@@ -74,13 +66,14 @@ fn get_settings_and_cmdline_parser() -> (clap::ArgMatches<'static>, Config) {
                     .short("t")
                     .long("to")
                     .value_name("DATE")
-                    .help("Enddatum für Zeitabfrage"),
+                    .help("Enddatum für Zeitabfrage (einschließlich), Standard = Ende der Woche"),
             )
             .get_matches(),
         config,
     )
 }
 
+#[derive(Clone)]
 pub struct Settings {
     pub from: chrono::NaiveDate,
     pub to: chrono::NaiveDate,
@@ -89,7 +82,7 @@ pub struct Settings {
     pub password: String,
 }
 
-pub fn get_settings() -> Result<Settings, failure::Error> {
+pub fn get_settings() -> Result<Settings, anyhow::Error> {
     let (matches, config) = get_settings_and_cmdline_parser();
 
     let (from, to) = month_span_from_args(&matches)?;
@@ -101,7 +94,7 @@ pub fn get_settings() -> Result<Settings, failure::Error> {
             .or(config.teilzeitfaktor)
             .unwrap_or(1.0);
 
-    let service = "redmine.indurad.x";
+    let service = env!("REDMINE_SERVER_NAME"); // TODO: This should really be a conf
     let username = matches
         .value_of("user")
         .map(|v| v.to_owned())
@@ -109,7 +102,7 @@ pub fn get_settings() -> Result<Settings, failure::Error> {
         .unwrap();
 
     let password = {
-        let keyring = keyring::Keyring::new(&service, &username);
+        let keyring = keyring::Entry::new(&service, &username);
 
         keyring.get_password().unwrap_or_else(|_| {
             let pw = rpassword::prompt_password_stderr(&format!("Password for {}: ", &username))
@@ -132,11 +125,11 @@ pub fn get_settings() -> Result<Settings, failure::Error> {
 
 fn month_span_from_args(
     v: &clap::ArgMatches,
-) -> Result<(chrono::NaiveDate, chrono::NaiveDate), failure::Error> {
-    use date_helper::*;
+) -> Result<(chrono::NaiveDate, chrono::NaiveDate), anyhow::Error> {
+    use crate::date_helper::*;
 
     let alt_from = current_month();
-    let alt_to = next_month(current_month()).pred();
+    let alt_to = next_week_monday(today()).pred();
 
     let from = v
         .value_of("from")

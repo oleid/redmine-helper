@@ -1,7 +1,4 @@
-extern crate chrono;
-extern crate failure;
-extern crate reqwest;
-extern crate serde_json;
+use anyhow::{anyhow, Context};
 
 type TimeStamp = chrono::DateTime<chrono::Utc>;
 
@@ -33,23 +30,27 @@ pub struct TimeEntry {
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(unused)]
 pub struct Issue {
     id: u64,
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(unused)]
 pub struct User {
     id: u64,
     name: String,
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(unused)]
 pub struct Project {
     id: u64,
     name: String,
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(unused)]
 pub struct Activity {
     id: u64,
     name: String,
@@ -58,7 +59,7 @@ pub struct Activity {
 pub struct HoursSpent {
     from: chrono::NaiveDate,
     to: chrono::NaiveDate,
-    time_entries: <Vec<TimeEntry> as IntoIterator>::IntoIter,
+    time_entries: Vec<TimeEntry>,
     client: reqwest::Client,
     page: i64,
     per_page: i64,
@@ -72,61 +73,51 @@ impl HoursSpent {
         to: chrono::NaiveDate,
         user: &str,
         password: &str,
-    ) -> Result<Self, failure::Error> {
-        Ok(HoursSpent {
+        client: reqwest::Client,
+    ) -> Self {
+        HoursSpent {
             from,
             to,
-            time_entries: vec![].into_iter(),
-            client: reqwest::Client::new(),
+            time_entries: Vec::new(),
+            client,
             page: 0,
             per_page: 100,
             total: 0,
             credentials: (user.to_owned(), password.to_owned()),
-        })
+        }
     }
 
-    fn try_next(&mut self) -> Result<Option<TimeEntry>, failure::Error> {
-        if let Some(entry) = self.time_entries.next() {
-            return Ok(Some(entry));
+    pub(crate) async fn run(mut self) -> Result<Vec<TimeEntry>, anyhow::Error> {
+        loop {
+            if self.page > 0 && self.page * self.per_page >= self.total {
+                break;
+            }
+
+            self.page += 1;
+            let url = format!("https://{}/time_entries.json?user_id=me&set_filter=1&limit={}&period_type=2&from={}&to={}&page={}",
+env!("REDMINE_SERVER_NAME"), // TODO: This should really be a conf
+                              self.per_page,
+                              self.from,
+                              self.to.pred(), // end date not included
+                              self.page);
+            let req = self
+                .client
+                .get(&url)
+                .basic_auth(self.credentials.0.clone(), Some(self.credentials.1.clone()))
+                .send()
+                .await
+                .with_context(|| "While attempting to download hours from redmine.")?;
+
+            if req.status() != 200 {
+                return Err(anyhow!("Unexpected http status : {}", req.status()));
+            }
+
+            let response = req.json::<ApiResponse>().await?;
+            self.time_entries.extend(response.time_entries.into_iter());
+            self.total = response.total_count;
+            self.per_page = response.limit; // redmine seems to ignore the arg, if we request "too many".
         }
-
-        if self.page > 0 && self.page * self.per_page >= self.total {
-            return Ok(None);
-        }
-
-        self.page += 1;
-        let url = format!("https://{}/time_entries.json?user_id=me&set_filter=1&limit={}&period_type=2&from={}&to={}&page={}",
-                          env!("REDMINE_SERVER_NAME"), // TODO: This should really be a config setting, but a compile time env is good enough for now
-                          self.per_page,
-                          self.from,
-                          self.to,
-                          self.page);
-        let mut req = self
-            .client
-            .get(&url)
-            .basic_auth(self.credentials.0.clone(), Some(self.credentials.1.clone()))
-            .send()?;
-        if req.status() != 200 {
-            panic!("Unexpected http status : {}", req.status())
-        }
-
-        let response = req.json::<ApiResponse>()?;
-        self.time_entries = response.time_entries.into_iter();
-        self.total = response.total_count;
-        self.per_page = response.limit; // redmine seems to ignore the arg, if we request "too many".
-        Ok(self.time_entries.next())
-    }
-}
-
-impl Iterator for HoursSpent {
-    type Item = Result<TimeEntry, failure::Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.try_next() {
-            Ok(Some(dep)) => Some(Ok(dep)),
-            Ok(None) => None,
-            Err(err) => Some(Err(err)),
-        }
+        Ok(self.time_entries)
     }
 }
 

@@ -1,7 +1,8 @@
 [package]
 name = "redmine-helper"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Olaf Leidinger <oleid@mescharet.de>"]
+edition = "2021"
 
 # Custom settings to optimize for size
 [profile.release]
@@ -15,14 +16,12 @@ lto = true
 chrono = { version = "0.4", features = ["serde"] }
 clap = "2"
 directories = "1.0"
-env_logger = "0.7"
-failure = "0.1"
-keyring = "0.6"
-log = "0.4"
+anyhow = "1.0"
+keyring = "1.1"
 prettytable-rs = "0.8"
-rayon = "1.0"
-reqwest = "0.9"
-rpassword = "2.0.0"
+tokio = { version = "1.0.0", features = ["full", "tracing"] }
+reqwest = { version = "0.11", features = ["json"] }
+rpassword = "5"
 serde_derive = "1.0"
 serde_json = "1.0"
 serde = "1.0"
